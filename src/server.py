@@ -209,6 +209,34 @@ def make_server(client: AbletonBridgeClient | None = None) -> StdioMcpServer:
             return {"jumped": cue}
         raise ValueError("action must be list, add, rename, delete, or jump")
 
+    def live_arrange(args):
+        params = dict(args or {})
+        locators = params.pop("locators", None) or []
+        params.setdefault("timeout", 120)
+        result = bridge.request("arrange", params)
+        if locators:
+            result["locators"] = []
+            for locator in locators:
+                try:
+                    added = live_cue_points({"action": "add", "time": locator["time"], "name": locator.get("name")})
+                    result["locators"].append(added["cue_point"])
+                except Exception as exc:
+                    result["errors"].append("locator at %s: %s" % (locator.get("time"), exc))
+        return result
+
+    server.add_tool(Tool("live_arrange", (
+        "Build/update an arrangement in one call. tracks[]: name, type midi|audio, color, instrument | sample (Simpler), "
+        "devices[], volume/pan/sends (number or display like '-6 dB'), params[{device,param,display|value}], "
+        "clear (true | [start,end] beats), clips[] audio {file,start,warp,repeat,every,name} or MIDI "
+        "{start,length,notes[[pitch,start,dur,vel]],repeat,every}. tempo; locators[{time,name}]. Errors collected per item."
+    ), schema({
+        "tempo": {"type": "number"},
+        "tracks": {"type": "array", "items": {"type": "object"}},
+        "locators": {"type": "array", "items": {"type": "object", "properties": {
+            "time": {"type": "number"}, "name": {"type": "string"},
+        }, "required": ["time"], "additionalProperties": False}},
+        "timeout": {"type": "number"},
+    }), live_arrange))
     server.add_tool(Tool("live_cue_points", "Arrangement locators: list, add(time[,name]), rename(time|name,new_name), delete(time|name), jump. Beats; add/delete need transport stopped, playhead restored.", schema({
         "action": {"type": "string", "enum": ["list", "add", "rename", "delete", "jump"]},
         "time": {"type": "number"},

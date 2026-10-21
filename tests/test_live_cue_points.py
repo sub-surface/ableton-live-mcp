@@ -117,3 +117,25 @@ def test_add_refuses_while_playing():
     with pytest.raises(RuntimeError, match="stop the transport"):
         _call(make_server(CueBridge(song)), {"action": "add", "time": 16})
     assert song.cue_points == []
+
+
+def test_live_arrange_adds_locators_after_building_and_collects_their_errors():
+    song = FakeSong([(0.0, "Intro")])
+
+    class ArrangeBridge(CueBridge):
+        def request(self, method, params):
+            if method == "arrange":
+                self.arranged = params
+                return {"tracks": [], "errors": []}
+            return CueBridge.request(self, method, params)
+
+    bridge = ArrangeBridge(song)
+    response = make_server(bridge).handle({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "live_arrange", "arguments": {"tracks": [], "locators": [{"time": 64, "name": "Drop"}, {"time": 999}]}},
+    })
+    result = response["result"]["structuredContent"]
+    assert "locators" not in bridge.arranged and bridge.arranged["timeout"] == 120
+    assert result["locators"] == [{"time": 64.0, "name": "Drop"}]
+    assert len(result["errors"]) == 1 and result["errors"][0].startswith("locator at 999")
+    assert _names(song) == [(0.0, "Intro"), (64.0, "Drop")]

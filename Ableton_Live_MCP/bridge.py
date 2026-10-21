@@ -1971,6 +1971,116 @@ class AbletonLiveMCP(ControlSurface):
             return
         self.schedule_message(1, self._meter_tick)
 
+    def _rpc_arrange(self, params):
+        # Build or update an arrangement in one main-thread pass from a declarative spec:
+        # tracks by name (created when missing), instruments/samples, devices, mixer settings,
+        # cleared ranges, audio clips (with repeats) and MIDI clips. Errors are collected per
+        # item instead of aborting, so one bad file doesn't lose the rest of the build.
+        song = self.song()
+        if params.get("tempo") is not None:
+            song.tempo = float(params["tempo"])
+        report, errors = [], []
+        for spec in params.get("tracks") or []:
+            name = spec.get("name")
+            try:
+                track, created = self._arrange_track(song, spec)
+            except Exception as exc:
+                errors.append("track %r: %s" % (name, exc))
+                continue
+            entry = {"name": track.name, "created": created, "clips": 0}
+            for label, step in (("setup", self._arrange_setup), ("clear", self._arrange_clear)):
+                try:
+                    step(track, spec, created)
+                except Exception as exc:
+                    errors.append("%s %r: %s" % (label, name, exc))
+            for clip_spec in spec.get("clips") or []:
+                try:
+                    entry["clips"] += self._arrange_clip(track, clip_spec)
+                except Exception as exc:
+                    errors.append("clip on %r at %s: %s" % (name, clip_spec.get("start"), exc))
+            report.append(entry)
+        return {"tracks": report, "errors": errors, "song_length": getattr(song, "song_length", None)}
+
+    def _arrange_track(self, song, spec):
+        kind = spec.get("type") or ("midi" if spec.get("instrument") or spec.get("sample") or
+                                    any("notes" in c for c in spec.get("clips") or []) else "audio")
+        track = next((t for t in song.tracks if t.name == spec["name"]), None)
+        if track is not None:
+            if (kind == "midi") != bool(getattr(track, "has_midi_input", kind == "midi")):
+                raise ValueError("existing track is not a %s track" % kind)
+            return track, False
+        if spec.get("create") is False:
+            raise ValueError("no such track and create is false")
+        (song.create_midi_track if kind == "midi" else song.create_audio_track)(-1)
+        track = song.tracks[len(song.tracks) - 1]
+        track.name = spec["name"]
+        return track, True
+
+    def _arrange_setup(self, track, spec, created):
+        if spec.get("color") is not None:
+            track.color_index = int(spec["color"])
+        if created and spec.get("sample"):
+            self._rpc_load_sample({"file_path": spec["sample"], "target_track": self._ref_for(track)})
+        elif created and spec.get("instrument"):
+            track.insert_device(spec["instrument"], -1)
+        if created:
+            for device_name in spec.get("devices") or []:
+                track.insert_device(device_name, -1)
+        mixer = track.mixer_device
+        if spec.get("volume") is not None:
+            self._set_by_value_or_display(mixer.volume, spec["volume"])
+        if spec.get("pan") is not None:
+            self._set_by_value_or_display(mixer.panning, spec["pan"])
+        sends = spec.get("sends") or []
+        for index, value in (sends.items() if isinstance(sends, dict) else enumerate(sends)):
+            index = ord(index.upper()) - ord("A") if isinstance(index, str) else int(index)
+            self._set_by_value_or_display(mixer.sends[index], value)
+        for setting in spec.get("params") or []:
+            device = next(d for d in track.devices if setting["device"] in (getattr(d, "name", None), getattr(d, "class_name", None)))
+            param = next(p for p in device.parameters if p.name == setting["param"])
+            self._set_by_value_or_display(param, setting.get("display", setting.get("value")))
+
+    def _arrange_clear(self, track, spec, created):
+        clear = spec.get("clear")
+        if not clear or created:
+            return
+        start, end = (float("-inf"), float("inf")) if clear is True else (float(clear[0]), float(clear[1]))
+        for clip in list(track.arrangement_clips):
+            if clip.start_time < end and clip.end_time > start:
+                track.delete_clip(clip)
+
+    def _arrange_clip(self, track, spec):
+        start = float(spec["start"])
+        repeat, every, placed = max(int(spec.get("repeat") or 1), 1), spec.get("every"), 0
+        for n in range(repeat):
+            if "notes" in spec:
+                clip = track.create_midi_clip(start, float(spec["length"]))
+                notes = [n_ if isinstance(n_, dict) else dict(zip(("pitch", "start_time", "duration", "velocity"), n_)) for n_ in spec["notes"]]
+                clip.add_new_notes(tuple(Live.Clip.MidiNoteSpecification(
+                    pitch=int(x["pitch"]), start_time=float(x["start_time"]), duration=float(x["duration"]),
+                    velocity=float(x.get("velocity", 100)), mute=bool(x.get("mute", False))) for x in notes))
+            else:
+                clip = track.create_audio_clip(str(spec["file"]), start)
+                if spec.get("warp") is not None:
+                    clip.warping = bool(spec["warp"])
+            if spec.get("name"):
+                clip.name = spec["name"]
+            if spec.get("color") is not None:
+                clip.color_index = int(spec["color"])
+            elif getattr(track, "color_index", None) is not None:
+                clip.color_index = track.color_index
+            placed += 1
+            start += float(every) if every is not None else float(clip.end_time - clip.start_time)
+        return placed
+
+    def _set_by_value_or_display(self, param, value):
+        param.value = self._value_for_display(param, value) if isinstance(value, str) else float(value)
+
+    def _ref_for(self, obj):
+        obj_id = self._object_id(obj)
+        self._remember_object(obj_id, obj)
+        return {"id": obj_id}
+
     def _rpc_eval(self, params):
         self._reject_legacy_note_api_code(params.get("expr"), params)
         ref = params.get("ref")
