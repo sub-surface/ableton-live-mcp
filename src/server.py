@@ -11,6 +11,7 @@ from typing import Any
 from bridge import AbletonBridgeClient, AbletonBridgeError, BridgeConfig
 from agent_m4l import build_device, command_file as agent_m4l_command_file, device_name as agent_m4l_device_name, infer_device_bounds, normalize_role, slugify, status_file as agent_m4l_status_file, udp_port as agent_m4l_udp_port, write_webui, write_webui_asset_files, write_webui_assets
 from mcp_stdio import StdioMcpServer, Tool
+from audio_analysis import analyze_audio
 from similar_sounds import find_similar_sounds
 from visual_capture import capture_ableton_window, capture_max_console_window
 
@@ -755,6 +756,18 @@ def make_server(client: AbletonBridgeClient | None = None) -> StdioMcpServer:
         "include_self": {"type": "boolean"},
         "db_path": {"type": "string"},
     }), find_similar_sounds))
+    server.add_tool(Tool("analyze_audio", (
+        "Offline sample analysis (no Live): duration, peak/RMS/LUFS, kind loop|one_shot; loops get bpm (exact from "
+        "bar length when it fits) and key+Camelot; one-shots get root note/cents. target_key/target_tempo give the "
+        "transpose/ratio to match. Needs numpy."
+    ), schema({
+        "file_path": {"type": "string"},
+        "file_paths": {"type": "array", "items": {"type": "string"}, "maxItems": 64},
+        "target_key": {"type": "string"},
+        "target_tempo": {"type": "number"},
+        "bpm_range": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},
+        "max_seconds": {"type": "number"},
+    }), analyze_audio))
     server.add_tool(Tool("live_eval", "Eval expression; use live_exec.", schema({
         "expr": {"type": "string"},
         "ref": ref,

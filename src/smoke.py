@@ -219,6 +219,85 @@ def run_core_regression(
     return (0 if output["ok"] else 1), output
 
 
+def run_power_tools_regression(client: AbletonBridgeClient | None = None, *, audio_file: Path | None = None) -> tuple[int, dict[str, Any]]:
+    """Destructive: exercise live_arrange, display-value params, live_load_sample, live_cue_points,
+    live_meters and analyze_audio past the end of the open set, then remove what it made."""
+    from server import make_server
+
+    client = client or AbletonBridgeClient()
+    mcp = make_server(client)
+    checks: list[dict[str, Any]] = []
+    prefix = "MCP Power "
+
+    def tool(name: str, args: dict[str, Any]) -> Any:
+        try:
+            result = _mcp_tool_call(mcp, name, args)
+        except Exception as exc:
+            checks.append(_fail(name, exc))
+            raise
+        checks.append(_ok(name, result))
+        return result
+
+    def expect(name: str, condition: bool, detail: Any) -> None:
+        checks.append({"name": name, "ok": bool(condition), "result" if condition else "error": detail})
+        if not condition:
+            raise RuntimeError("%s: %s" % (name, detail))
+
+    state = client.request("exec", {"code": "result = [song.song_length, song.current_song_time, [(c.time, c.name) for c in song.cue_points]]"})
+    start = math.ceil(float(state[0]) / 16.0) * 16.0 + 16.0
+    wav = str(audio_file or _write_regression_wav())
+    try:
+        built = tool("live_arrange", {"tracks": [
+            {"name": prefix + "Audio", "type": "audio", "volume": "-6 dB", "devices": ["Auto Filter"],
+             "params": [{"device": "Auto Filter", "param": "Frequency", "display": "1.00 kHz"}],
+             "clips": [{"file": wav, "start": start, "repeat": 2, "every": 4}]},
+            {"name": prefix + "MIDI", "type": "midi", "sample": wav,
+             "clips": [{"start": start, "length": 4, "notes": [[60, 0, 1, 100], [67, 2, 1, 90]]}]},
+        ], "locators": [{"time": start, "name": prefix + "Cue"}]})
+        expect("arrange_without_errors", not built.get("errors"), built.get("errors"))
+        readback = client.request("eval", {"expr": (
+            "[(t.name, t.mixer_device.volume.str_for_value(t.mixer_device.volume.value), len(t.arrangement_clips),"
+            " [(d.class_name, [p.str_for_value(p.value) for p in d.parameters if p.name == 'Frequency']) for d in t.devices])"
+            " for t in song.tracks if t.name.startswith(%r)]" % prefix)})
+        audio, midi = readback[0], readback[1]
+        expect("display_values_applied", audio[1].replace(chr(0x2212), "-").startswith("-6") and "1.00 kHz" in str(audio[3]), audio)
+        expect("clips_placed", audio[2] == 2 and midi[2] == 1, readback)
+        expect("sample_loaded_into_simpler", any(d[0] == "OriginalSimpler" for d in midi[3]), midi[3])
+        midi_index = client.request("eval", {"expr": "[i for i, t in enumerate(song.tracks) if t.name == %r][0]" % (prefix + "MIDI")})
+        swapped = tool("live_load_sample", {"file_path": wav, "target_track": {"path": "live_set tracks %d" % midi_index}})
+        expect("sample_replaced_in_place", swapped.get("replaced") and swapped.get("verified"), swapped)
+        cues = tool("live_cue_points", {"action": "rename", "name": prefix + "Cue", "new_name": prefix + "Renamed"})
+        expect("cue_renamed", cues["cue_point"]["name"] == prefix + "Renamed", cues)
+        meters = tool("live_meters", {"play_from": start, "duration": 2.0, "tracks": [prefix + "Audio"]})
+        expect("meters_sampled", meters.get("samples", 0) > 0 and meters.get("method") == "remote_tick", {k: meters.get(k) for k in ("samples", "method", "rate_hz")})
+        analysis = tool("analyze_audio", {"file_path": wav})
+        expect("analysis_root_note", (analysis.get("root") or {}).get("note") == "E4", analysis.get("root"))
+    except Exception as exc:
+        if not checks or checks[-1]["ok"]:
+            checks.append(_fail("power_tools_assertion", exc))
+    finally:
+        try:
+            mcp_cues = _mcp_tool_call(mcp, "live_cue_points", {"action": "list"})["cue_points"]
+            for cue in mcp_cues:
+                if str(cue["name"]).startswith(prefix):
+                    _mcp_tool_call(mcp, "live_cue_points", {"action": "delete", "time": cue["time"]})
+            client.request("exec", {"code": (
+                "for i in reversed(range(len(song.tracks))):\n"
+                "    if song.tracks[i].name.startswith(%r):\n"
+                "        song.delete_track(i)\n"
+                "song.current_song_time = %r" % (prefix, float(state[1])))})
+            after = client.request("eval", {"expr": "[(c.time, c.name) for c in song.cue_points]"})
+            expect("cleanup_restored_cues", sorted(map(tuple, after)) == sorted(map(tuple, state[2])), after)
+        except Exception as exc:
+            if not checks or checks[-1]["ok"]:
+                checks.append(_fail("power_tools_cleanup", exc))
+
+    failed = [check for check in checks if not check["ok"]]
+    compact = [{key: value for key, value in check.items() if key != "result"} for check in checks]
+    return (0 if not failed else 1), {"ok": not failed, "destructive": True, "checks": compact,
+                                      "summary": {"total": len(checks), "passed": len(checks) - len(failed), "failed": len(failed)}}
+
+
 def run_generated_m4l_regression(
     client: AbletonBridgeClient | None = None,
     *,
@@ -744,11 +823,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run Ableton Live MCP smoke checks.")
     parser.add_argument("--core-regression", action="store_true", help="Run destructive checks for library device load, MIDI clips, audio import, and similar sounds.")
     parser.add_argument("--generated-m4l", action="store_true", help="Run destructive generated M4L instrument/audio-effect/MIDI-effect checks.")
+    parser.add_argument("--power-tools", action="store_true", help="Run destructive checks for live_arrange, display-value params, cue points, meters and analyze_audio.")
     parser.add_argument("--detail", action="store_true", help="Include full regression result payloads instead of compact evidence.")
     parser.add_argument("--yes", action="store_true", help="Required with destructive regression checks because they modify the open Live set.")
     args = parser.parse_args()
-    destructive = args.core_regression or args.generated_m4l
-    if args.core_regression and args.generated_m4l:
+    destructive = args.core_regression or args.generated_m4l or args.power_tools
+    if sum((args.core_regression, args.generated_m4l, args.power_tools)) > 1:
         print("Choose only one destructive smoke mode at a time.", file=sys.stderr)
         return 2
     if destructive and not args.yes:
@@ -759,6 +839,8 @@ def main() -> int:
             code, output = run_core_regression(compact=not args.detail)
         elif args.generated_m4l:
             code, output = run_generated_m4l_regression(compact=not args.detail)
+        elif args.power_tools:
+            code, output = run_power_tools_regression()
         else:
             code, output = run_smoke()
     except AbletonBridgeError as exc:
